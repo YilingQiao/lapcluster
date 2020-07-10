@@ -1,17 +1,13 @@
-
 import torch
 import torch.nn as nn
 import numpy as np
 import time
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import Dataset, IterableDataset, DataLoader, Sampler, BatchSampler
-from os import makedirs
-from os.path import exists, join, isfile, dirname, abspath
+
 from sklearn.cluster import KMeans
 
 import helper_torch_util
 from laplacian import Laplacian
+from normal import compute_normal 
 
 
 class LapCluster(nn.Module):
@@ -21,7 +17,7 @@ class LapCluster(nn.Module):
         self.cfg            = cfg
         self.compute_lap    = Laplacian(cot=True)
 
-        f_conv2d  = helper_torch_util.conv2d(True, 1, 256, kernel_size=[1,28])
+        f_conv2d  = helper_torch_util.conv2d(True, 1, 256, kernel_size=[1,22])
         setattr(self, 'mlp_in', f_conv2d)
 
         for i in range(self.cfg.num_blocks):
@@ -67,7 +63,7 @@ class LapCluster(nn.Module):
         # group_idx B x 
         B, d, N, k = feature.size()
         _inf            = -100
-        padding_inf     = _inf * torch.ones([B, d, N, k])
+        padding_inf     = _inf * torch.ones([B, d, N, k], device=self.device)
         cluster_feature = []
 
         m_pool2d    = nn.MaxPool2d([N, 1])
@@ -82,7 +78,7 @@ class LapCluster(nn.Module):
             
         cluster_feature = torch.cat([x.unsqueeze(-1) for x in cluster_feature], dim=-1)
 
-        pooling_sum = torch.zeros([B, d, N, 1])
+        pooling_sum = torch.zeros([B, d, N, 1], device=self.device)
 
         for i in range(num_cluster):
             net = cluster_feature[:,:,i].unsqueeze(-1).unsqueeze(-1)
@@ -93,7 +89,7 @@ class LapCluster(nn.Module):
             pooling_sum = pooling_sum + net
         return pooling_sum
 
-    def forward(self, inputs):
+    def preprocess(self, inputs):
         # B x nv x 3
         verts       = inputs['verts']
         # B x nf x 3
@@ -102,31 +98,48 @@ class LapCluster(nn.Module):
         batch_size  = verts.size()[0]
 
         clusters    = []
-        eigs        = []
+        new_feature = []
 
         for i in range(batch_size):
             #features    = vertices
             face        = faces[i]
             vert        = verts[i]
 
+            normal      = compute_normal(vert, face)
             lap_matrix  = self.compute_lap(face, vert)
 
             eig_val, eig_vec = torch.symeig(lap_matrix, eigenvectors=True)
             eig_vec = eig_vec.narrow(1, 1, self.cfg.num_eig)
-            feature = torch.cat([vert, eig_vec], 1)
-            eigs.append(feature.unsqueeze(0))
+
+            if 'features' not in inputs.keys():
+                feature = torch.cat([vert, eig_vec, 
+                                    torch.from_numpy(normal)], 1)
+                new_feature.append(feature.unsqueeze(0))
 
             cluster_idx = self.compute_cluster(eig_vec, self.cfg.num_cluster)
-
             clusters.append(np.expand_dims(cluster_idx, axis=1))
 
-        # layer x B x nv
-        clusters    = torch.from_numpy(np.concatenate(clusters, axis=1))
-   
         # B x nv x d
-        features    = torch.cat(eigs, 0).unsqueeze(1)
-    
+        if 'features' not in inputs.keys():
+            features    = torch.cat(new_feature, 0).unsqueeze(1)
+        else:
+            features    = inputs['features']
+
+        # layer x B x nv
+        clusters        = torch.from_numpy(np.concatenate(clusters, axis=1))
+      
+
+        return features, clusters
+    def forward(self, inputs, device):
+        features, clusters = self.preprocess(inputs)
+
+        self.device = device
+        self.to(device)
+        features    = features.to(device)
+        clusters    = clusters.to(device)
+
         K           = features.size()[-1]
+        batch_size  = features.size()[0]
 
         m_conv2d    = getattr(self, 'mlp_in')
         features    = m_conv2d(features)
@@ -173,4 +186,4 @@ class LapCluster(nn.Module):
         m_dense     = getattr(self, 'dense_3')
         net         = m_dense(net)
 
-        return out_max
+        return net
