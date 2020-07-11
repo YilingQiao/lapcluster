@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import time
 
@@ -31,6 +32,14 @@ class LapCluster(nn.Module):
             setattr(self, 'mlp_'+str(i)+'_3', f_conv2d)
 
 
+            f_conv2d  = helper_torch_util.conv2d(True, 128, 128)
+            setattr(self, 'mlp_corr_'+str(i)+'_1', f_conv2d)
+            f_conv2d  = helper_torch_util.conv2d(True, 128, 256)
+            setattr(self, 'mlp_corr_'+str(i)+'_2', f_conv2d)
+            f_conv2d  = helper_torch_util.conv2d(True, 256, 32)
+            setattr(self, 'mlp_corr_'+str(i)+'_3', f_conv2d)
+
+
         f_conv2d = helper_torch_util.conv2d(True, 256, 128)
         setattr(self, 'mlp_out1', f_conv2d)
 
@@ -58,26 +67,51 @@ class LapCluster(nn.Module):
 
         return np.concatenate(cluster_idx, axis=0)
 
-    def pooling_block(self, feature, group_idx, num_cluster):
+    def pooling_block(self, feature, group_idx, num_block):
         # feature   B x d x nv x 1
         # group_idx B x 
-        B, d, N, k = feature.size()
+        B, d, N, k  = feature.size()
+        num_cluster = self.cfg.num_cluster[num_block]
         _inf            = -100
         padding_inf     = _inf * torch.ones([B, d, N, k], device=self.device)
         cluster_feature = []
+        cluster_corr    = []
 
         m_pool2d    = nn.MaxPool2d([N, 1])
+        m_pool2d_c  = nn.MaxPool2d([N, 1])
+
+
+        m_conv2d    = getattr(self, 'mlp_corr_'+str(num_block)+'_1')
+        corr_feat   = m_conv2d(feature)
+        m_conv2d    = getattr(self, 'mlp_corr_'+str(num_block)+'_2')
+        corr_feat   = m_conv2d(corr_feat)
+        m_conv2d    = getattr(self, 'mlp_corr_'+str(num_block)+'_3')
+        corr_feat   = m_conv2d(corr_feat)
+        pad_corr    = _inf * torch.ones(corr_feat.size(), device=self.device)
+        d2 = corr_feat.size()[1]
 
         for i in range(num_cluster):
-            cluster = torch.eq(group_idx, i).unsqueeze(-1).unsqueeze(1)
-            cluster = cluster.expand(B, d, N, 1)
+            cluster_o       = torch.eq(group_idx, i).unsqueeze(-1).unsqueeze(1)
+            cluster         = cluster_o.expand(B, d, N, 1)
             cluster_pooling = torch.where(cluster, feature, padding_inf)
             cluster_pooling = m_pool2d(cluster_pooling)
-
             cluster_feature.append(cluster_pooling.squeeze(-1).squeeze(-1))
-            
-        cluster_feature = torch.cat([x.unsqueeze(-1) for x in cluster_feature], dim=-1)
 
+            cluster         = cluster_o.expand(B, d2, N, 1)
+            corr_pooling    = torch.where(cluster, corr_feat, pad_corr)
+            corr_pooling    = m_pool2d_c(corr_pooling)
+            cluster_corr.append(corr_pooling.squeeze(-1).squeeze(-1))  
+
+        cluster_feature = torch.cat([x.unsqueeze(-1) 
+                                for x in cluster_feature], dim=-1)
+        cluster_corr    = torch.cat([x.unsqueeze(-1) 
+                                for x in cluster_corr], dim=-1)
+        corr_matrix     = cluster_corr.transpose(-2,-1)
+        corr_matrix     = F.normalize(corr_matrix, dim=-1, p=2)
+        corr_matrix     = corr_matrix.matmul(corr_matrix.transpose(-2,-1))
+        
+        cluster_feature = cluster_feature.matmul(corr_matrix)
+       
         pooling_sum = torch.zeros([B, d, N, 1], device=self.device)
 
         for i in range(num_cluster):
@@ -87,7 +121,69 @@ class LapCluster(nn.Module):
             cluster = cluster.expand(B, d, N, 1)
             net = torch.where(cluster, net, 0*net)
             pooling_sum = pooling_sum + net
+
+        print(pooling_sum.size())
+        exit()
+
         return pooling_sum
+
+    def forward(self, inputs, device):
+        features, clusters = self.preprocess(inputs)
+
+        self.device = device
+        self.to(device)
+        features    = features.to(device)
+        clusters    = clusters.to(device)
+
+        K           = features.size()[-1]
+        batch_size  = features.size()[0]
+
+        m_conv2d    = getattr(self, 'mlp_in')
+        features    = m_conv2d(features)
+
+        for i in range(self.cfg.num_blocks):
+            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_1')
+            features    = m_conv2d(features)
+
+            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_2')
+            features    = m_conv2d(features)
+
+            out_pool    = self.pooling_block(features, clusters[i], i)
+
+            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_3')
+            features    = m_conv2d(features)
+
+            features    = torch.cat([features, out_pool], 1)
+
+        m_conv2d    = getattr(self, 'mlp_out1')
+        out1        = m_conv2d(features)
+
+        m_conv2d    = getattr(self, 'mlp_out2')
+        out2        = m_conv2d(out1)
+
+        nv          = features.size()[2]
+        m_pool2d    = nn.MaxPool2d([nv, 1])
+        out_max     = m_pool2d(out2)
+
+        net         = torch.reshape(out_max, (batch_size, -1))
+
+
+        m_dense     = getattr(self, 'dense_1')
+        m_leakyrelu = nn.LeakyReLU(0.2)
+        m_dropout   = nn.Dropout(0.7)
+        #net         = m_dropout(m_leakyrelu(self.dense_bn1(m_dense(net).unsqueeze(1)))).squeeze(1)
+        net         = m_dropout(m_leakyrelu(m_dense(net)))
+
+        m_dense     = getattr(self, 'dense_2')
+        m_leakyrelu = nn.LeakyReLU(0.2)
+        m_dropout   = nn.Dropout(0.7)
+        #net         = m_dropout(m_leakyrelu(self.dense_bn1(m_dense(net).unsqueeze(1)))).squeeze(1)
+        net         = m_dropout(m_leakyrelu(m_dense(net)))
+
+        m_dense     = getattr(self, 'dense_3')
+        net         = m_dense(net)
+
+        return net
 
     def preprocess(self, inputs):
         # B x nv x 3
@@ -128,62 +224,4 @@ class LapCluster(nn.Module):
         # layer x B x nv
         clusters        = torch.from_numpy(np.concatenate(clusters, axis=1))
       
-
         return features, clusters
-    def forward(self, inputs, device):
-        features, clusters = self.preprocess(inputs)
-
-        self.device = device
-        self.to(device)
-        features    = features.to(device)
-        clusters    = clusters.to(device)
-
-        K           = features.size()[-1]
-        batch_size  = features.size()[0]
-
-        m_conv2d    = getattr(self, 'mlp_in')
-        features    = m_conv2d(features)
-
-        for i in range(self.cfg.num_blocks):
-            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_1')
-            features    = m_conv2d(features)
-
-            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_2')
-            features    = m_conv2d(features)
-
-            out_pool    = self.pooling_block(features, clusters[i], self.cfg.num_cluster[i])
-
-            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_3')
-            features    = m_conv2d(features)
-
-            features    = torch.cat([features, out_pool], 1)
-
-        m_conv2d    = getattr(self, 'mlp_out1')
-        out1        = m_conv2d(features)
-
-        m_conv2d    = getattr(self, 'mlp_out2')
-        out2        = m_conv2d(out1)
-
-        nv          = features.size()[2]
-        m_pool2d    = nn.MaxPool2d([nv, 1])
-        out_max     = m_pool2d(out2)
-
-        net         = torch.reshape(out_max, (batch_size, -1))
-
-
-        m_dense     = getattr(self, 'dense_1')
-        m_leakyrelu = nn.LeakyReLU(0.2)
-        m_dropout   = nn.Dropout(0.7)
-        #net         = m_dropout(m_leakyrelu(self.dense_bn1(m_dense(net).unsqueeze(1)))).squeeze(1)
-        net         = m_dropout(m_leakyrelu(m_dense(net)))
-
-        m_dense     = getattr(self, 'dense_2')
-        m_leakyrelu = nn.LeakyReLU(0.2)
-        m_dropout   = nn.Dropout(0.7)
-        #net         = m_dropout(m_leakyrelu(self.dense_bn1(m_dense(net).unsqueeze(1)))).squeeze(1)
-        net         = m_dropout(m_leakyrelu(m_dense(net)))
-
-        m_dense     = getattr(self, 'dense_3')
-        net         = m_dense(net)
-
-        return net
