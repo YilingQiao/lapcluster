@@ -32,7 +32,7 @@ class Laplacian(torch.nn.Module):
         super(Laplacian,self).__init__()
         self.cot = cot
     
-    def forward(self, F, V):
+    def forward(self, V, F):
         """
         If forward is explicitly called, V is still a Parameter or Variable
         But if called through __call__ it's a tensor.
@@ -57,7 +57,6 @@ class Laplacian(torch.nn.Module):
         F = self.F
         F_np = self.F_np
 
-        print('Computing the Laplacian!')
         # Compute cotangents
         if self.cot:
             C = cotangent(V, F)

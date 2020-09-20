@@ -1,12 +1,16 @@
-# Laplacian Cluster
-This is a PyTorch re-implementation to show the preprocessing of feature computation and clustering can be done on the fly.
+
+# Learning on 3D Meshes with Laplacian Encoding and Pooling
+This is a PyTorch re-implementation to show the preprocessing of feature computation and clustering can be done on the fly. (in progress)
 
 ## Usage
-Run a demo inference code for classification.
+Run a demo training code for coseg.
+
+1. Download the [COSEG](http://irc.cs.sdu.edu.cn/~yunhai/public_html/ssl/ssd.htm). A [script](https://github.com/ranahanocka/MeshCNN/blob/master/scripts/coseg_seg/get_data.sh) can be used to download the dataset. 
+
+2. Put the dataset in `../dataset` and make a working directory in `../work_dir`
+
+3. Runing the training code
 ```
-python script_inference.py
+python train_coseg
 ```
 
-The input to the network is faces, vertices, and features (optional, if there is no feature, it can be computed in the network) of a mesh. 
-
-`network.py` constructs the network in `__init__()`, preprocesses in `preprocess()`, and forward pass in `forward.py`. `laplacian.py` will compute the mesh Laplacian. `normal.py` computes the vertex normal. 

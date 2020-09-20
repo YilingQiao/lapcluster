@@ -9,6 +9,8 @@ from sklearn.cluster import KMeans
 import helper_torch_util
 from laplacian import Laplacian
 from normal import compute_normal 
+from utils import trans_augment
+
 
 
 class LapCluster(nn.Module):
@@ -18,44 +20,64 @@ class LapCluster(nn.Module):
         self.cfg            = cfg
         self.compute_lap    = Laplacian(cot=True)
 
-        f_conv2d  = helper_torch_util.conv2d(True, 1, 256, kernel_size=[1,22])
-        setattr(self, 'mlp_in', f_conv2d)
+        self.criterion = torch.nn.CrossEntropyLoss()
 
-        for i in range(self.cfg.num_blocks):
-            f_conv2d  = helper_torch_util.conv2d(True, 256, 64)
-            setattr(self, 'mlp_'+str(i)+'_1', f_conv2d)
-            
-            f_conv2d  = helper_torch_util.conv2d(True, 64, 128)
-            setattr(self, 'mlp_'+str(i)+'_2', f_conv2d)
-            
-            f_conv2d  = helper_torch_util.conv2d(True, 128, 128)
-            setattr(self, 'mlp_'+str(i)+'_3', f_conv2d)
+        ld = 1
+
+        concat_feature = []
+
+        for i, d in enumerate(cfg.d_in):
+            if i == 0:
+                f_conv2d  = helper_torch_util.conv2d(True, ld, d, kernel_size=[1,cfg.d_feature])
+                setattr(self, 'mlp_in_'+str(i), f_conv2d)
+                ld = d
+            else:
+                f_conv2d  = helper_torch_util.conv2d(True, ld, d, kernel_size=[1,1])
+                setattr(self, 'mlp_in_'+str(i), f_conv2d)
+                ld = d
+
+        for i in range(len(cfg.d_b1)):
+            ld1 = ld
+            for j, d in enumerate(cfg.d_b1[i]):
+                f_conv2d  = helper_torch_util.conv2d(True, ld1, d)
+                setattr(self, "mlp_{}_{}".format(i, j), f_conv2d)
+                ld1 = d
+
+            ld2 = ld1
+            for j, d in enumerate(cfg.d_b2[i]):
+                f_conv2d  = helper_torch_util.conv2d(True, ld2, d)
+                setattr(self, "mlp_corr_{}_{}".format(i, j), f_conv2d)
+                ld2 = d
+
+            ld = ld1
+            if cfg.pooling:
+                ld += ld2
 
 
-            f_conv2d  = helper_torch_util.conv2d(True, 128, 128)
-            setattr(self, 'mlp_corr_'+str(i)+'_1', f_conv2d)
-            f_conv2d  = helper_torch_util.conv2d(True, 128, 256)
-            setattr(self, 'mlp_corr_'+str(i)+'_2', f_conv2d)
-            f_conv2d  = helper_torch_util.conv2d(True, 256, 32)
-            setattr(self, 'mlp_corr_'+str(i)+'_3', f_conv2d)
+        ld = cfg.d_in[-1]
+        for i in range(len(cfg.d_b1)):
+            ld += cfg.d_b1[i][-1] 
+            if cfg.pooling:
+                ld += cfg.d_b2[i][-1]
 
 
-        f_conv2d = helper_torch_util.conv2d(True, 256, 128)
-        setattr(self, 'mlp_out1', f_conv2d)
+        for i, d in enumerate(cfg.d_outmlp):
+            f_conv2d  = helper_torch_util.conv2d(True, ld, d, kernel_size=[1,1])
+            setattr(self, 'mlp_out_'+str(i), f_conv2d)
+            ld = d
 
-        f_conv2d = helper_torch_util.conv2d(True, 128, 128)
-        setattr(self, 'mlp_out2', f_conv2d)
+        for i, d in enumerate(cfg.d_finalmlp):
+            f_conv2d  = helper_torch_util.conv2d(True, ld, d, kernel_size=[1,1])
+            setattr(self, 'final_'+str(i), f_conv2d)
+            ld = d
 
-        f_dense = nn.Linear(128, 256)
-        setattr(self, 'dense_1', f_dense)
-        self.dense_bn1 = nn.BatchNorm1d(256, eps=1e-6, momentum=0.99)
+            if i != len(cfg.d_finalmlp) - 1:
+                bn = nn.BatchNorm2d(d)
+                setattr(self, 'final_bn_'+str(i), bn)
+                f_dropout = nn.Dropout(0.5)
+                setattr(self, 'final_dropout_'+str(i), f_dropout)
 
-        f_dense = nn.Linear(256, 256)
-        setattr(self, 'dense_2', f_dense)
-        self.dense_bn2 = nn.BatchNorm1d(256, eps=1e-6, momentum=0.99)
 
-        f_dense = nn.Linear(256, self.cfg.cat_num)
-        setattr(self, 'dense_3', f_dense)
 
     def compute_cluster(self, feature, num_cluster):
         n_blocks = len(num_cluster)
@@ -72,7 +94,7 @@ class LapCluster(nn.Module):
         # group_idx B x 
         B, d, N, k  = feature.size()
         num_cluster = self.cfg.num_cluster[num_block]
-        _inf            = -100
+        _inf            = -1e7
         padding_inf     = _inf * torch.ones([B, d, N, k], device=self.device)
         cluster_feature = []
         cluster_corr    = []
@@ -81,17 +103,16 @@ class LapCluster(nn.Module):
         m_pool2d_c  = nn.MaxPool2d([N, 1])
 
 
-        m_conv2d    = getattr(self, 'mlp_corr_'+str(num_block)+'_1')
-        corr_feat   = m_conv2d(feature)
-        m_conv2d    = getattr(self, 'mlp_corr_'+str(num_block)+'_2')
-        corr_feat   = m_conv2d(corr_feat)
-        m_conv2d    = getattr(self, 'mlp_corr_'+str(num_block)+'_3')
-        corr_feat   = m_conv2d(corr_feat)
+        corr_feat = feature
+        for j, d in enumerate(self.cfg.d_b2[num_block]):
+            m_conv2d  = getattr(self, "mlp_corr_{}_{}".format(num_block, j))
+            corr_feat = m_conv2d(corr_feat)
+
         pad_corr    = _inf * torch.ones(corr_feat.size(), device=self.device)
         d2 = corr_feat.size()[1]
 
         for i in range(num_cluster):
-            cluster_o       = torch.eq(group_idx, i).unsqueeze(-1).unsqueeze(1)
+            cluster_o       = torch.eq(group_idx, i).unsqueeze(-1)
             cluster         = cluster_o.expand(B, d, N, 1)
             cluster_pooling = torch.where(cluster, feature, padding_inf)
             cluster_pooling = m_pool2d(cluster_pooling)
@@ -106,122 +127,142 @@ class LapCluster(nn.Module):
                                 for x in cluster_feature], dim=-1)
         cluster_corr    = torch.cat([x.unsqueeze(-1) 
                                 for x in cluster_corr], dim=-1)
+
         corr_matrix     = cluster_corr.transpose(-2,-1)
         corr_matrix     = F.normalize(corr_matrix, dim=-1, p=2)
         corr_matrix     = corr_matrix.matmul(corr_matrix.transpose(-2,-1))
-        
-        cluster_feature = cluster_feature.matmul(corr_matrix)
+        cluster_feature = cluster_feature.matmul(corr_matrix.transpose(-2,-1))
        
         pooling_sum = torch.zeros([B, d, N, 1], device=self.device)
 
         for i in range(num_cluster):
             net = cluster_feature[:,:,i].unsqueeze(-1).unsqueeze(-1)
             net = net.expand(B, d, N, 1)
-            cluster = torch.eq(group_idx, i).unsqueeze(-1).unsqueeze(1)
+            cluster = torch.eq(group_idx, i).unsqueeze(-1)
             cluster = cluster.expand(B, d, N, 1)
             net = torch.where(cluster, net, 0*net)
             pooling_sum = pooling_sum + net
 
-        print(pooling_sum.size())
-        exit()
 
         return pooling_sum
 
-    def forward(self, inputs, device):
-        features, clusters = self.preprocess(inputs)
 
-        self.device = device
-        self.to(device)
-        features    = features.to(device)
-        clusters    = clusters.to(device)
+    def forward(self, inputs):
+        device = self.device
+        cfg = self.cfg
 
-        K           = features.size()[-1]
-        batch_size  = features.size()[0]
+        feature = inputs['data']['feature'].to(device)
+        cluster = inputs['data']['cluster'].to(device)
+        feature = feature.unsqueeze(1)
 
-        m_conv2d    = getattr(self, 'mlp_in')
-        features    = m_conv2d(features)
+        concat_features = []
+        for i, d in enumerate(cfg.d_in):
+            m_conv2d  = getattr(self, 'mlp_in_'+str(i))
+            feature    = m_conv2d(feature)
+        concat_features.append(feature)
 
-        for i in range(self.cfg.num_blocks):
-            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_1')
-            features    = m_conv2d(features)
+        for i in range(len(cfg.d_b1)):
+            for j, d in enumerate(cfg.d_b1[i]):
+                m_conv2d  = getattr(self, "mlp_{}_{}".format(i, j))
+                feature = m_conv2d(feature)
 
-            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_2')
-            features    = m_conv2d(features)
+            if cfg.pooling:
+                out_pool = self.pooling_block(feature, cluster.narrow(1,i,1), i)
+                feature = torch.cat([feature, out_pool], 1)
+            concat_features.append(feature)
 
-            out_pool    = self.pooling_block(features, clusters[i], i)
+        feature = torch.cat(concat_features, axis=1)
+        for i, d in enumerate(cfg.d_outmlp):
+            m_conv2d = getattr(self, 'mlp_out_'+str(i))
+            feature = m_conv2d(feature)
 
-            m_conv2d    = getattr(self, 'mlp_'+str(i)+'_3')
-            features    = m_conv2d(features)
+        for i, d in enumerate(cfg.d_finalmlp):
+            m_conv2d = getattr(self, 'final_'+str(i))
+            feature = m_conv2d(feature)
 
-            features    = torch.cat([features, out_pool], 1)
+            if i != len(cfg.d_finalmlp) - 1:
+                m_bn = getattr(self, 'final_bn_'+str(i))
+                m_dropout = getattr(self, 'final_dropout_'+str(i))
+                feature = m_bn(feature)
+                feature = m_dropout(feature)
 
-        m_conv2d    = getattr(self, 'mlp_out1')
-        out1        = m_conv2d(features)
+        feature = F.log_softmax(feature, dim=1)
+        feature = feature.squeeze(-1)
 
-        m_conv2d    = getattr(self, 'mlp_out2')
-        out2        = m_conv2d(out1)
-
-        nv          = features.size()[2]
-        m_pool2d    = nn.MaxPool2d([nv, 1])
-        out_max     = m_pool2d(out2)
-
-        net         = torch.reshape(out_max, (batch_size, -1))
+        return feature
 
 
-        m_dense     = getattr(self, 'dense_1')
-        m_leakyrelu = nn.LeakyReLU(0.2)
-        m_dropout   = nn.Dropout(0.7)
-        #net         = m_dropout(m_leakyrelu(self.dense_bn1(m_dense(net).unsqueeze(1)))).squeeze(1)
-        net         = m_dropout(m_leakyrelu(m_dense(net)))
+    def get_loss(self, outputs, inputs):
+        label = inputs['data']['label'].to(self.device)
+        
+        loss = F.nll_loss(outputs, label)
+        return loss
 
-        m_dense     = getattr(self, 'dense_2')
-        m_leakyrelu = nn.LeakyReLU(0.2)
-        m_dropout   = nn.Dropout(0.7)
-        #net         = m_dropout(m_leakyrelu(self.dense_bn1(m_dense(net).unsqueeze(1)))).squeeze(1)
-        net         = m_dropout(m_leakyrelu(m_dense(net)))
+    def get_metric(self, outputs, inputs):
+        label = inputs['data']['label'].to(self.device)
+        predictions = torch.max(outputs, dim=-2).indices
+        result = (label==predictions).float().mean()
+        return result
 
-        m_dense     = getattr(self, 'dense_3')
-        net         = m_dense(net)
+    def transform(self, data, attr):
+        cfg = self.cfg
 
-        return net
+        normal = data['normal'] 
+        vert = data['vert'] 
+        eig_vec = data['eig_vec'] 
+        cluster = data['cluster'] 
+        label = data['label']
 
-    def preprocess(self, inputs):
-        # B x nv x 3
-        verts       = inputs['verts']
-        # B x nf x 3
-        faces       = inputs['faces']
+        if self.epoch > 10:
+            vert, normal = trans_augment(cfg.t_augment, vert, normals=normal)
 
-        batch_size  = verts.size()[0]
+        feature = np.hstack([vert, normal, eig_vec])
 
-        clusters    = []
-        new_feature = []
+        n = feature.shape[0]
+        if n > cfg.num_points:
+            idx = np.random.choice(n,
+                size=cfg.num_points,
+                replace=False)
+            if cfg.task == 'segmentation':
+                label = label[idx]
+            else:
+                label = label.expand_dims(0)
+            feature = feature[idx, :]
+            cluster = cluster[:, idx]
 
-        for i in range(batch_size):
-            #features    = vertices
-            face        = faces[i]
-            vert        = verts[i]
 
-            normal      = compute_normal(vert, face)
-            lap_matrix  = self.compute_lap(face, vert)
+        inputs = dict()
+        inputs['feature'] = torch.from_numpy(feature)
+        inputs['cluster'] = torch.from_numpy(cluster)
+        inputs['label'] = torch.from_numpy(label)
 
-            eig_val, eig_vec = torch.symeig(lap_matrix, eigenvectors=True)
-            eig_vec = eig_vec.narrow(1, 1, self.cfg.num_eig)
+        return inputs
 
-            if 'features' not in inputs.keys():
-                feature = torch.cat([vert, eig_vec, 
-                                    torch.from_numpy(normal)], 1)
-                new_feature.append(feature.unsqueeze(0))
+    def preprocess(self, data, attr=None):
+        # nv x 3
+        vert       = data['verts']
+        # nf x 3
+        face       = data['faces']
+        label = np.array(data['label']) 
 
-            cluster_idx = self.compute_cluster(eig_vec, self.cfg.num_cluster)
-            clusters.append(np.expand_dims(cluster_idx, axis=1))
 
-        # B x nv x d
-        if 'features' not in inputs.keys():
-            features    = torch.cat(new_feature, 0).unsqueeze(1)
-        else:
-            features    = inputs['features']
+        normal = compute_normal(vert, face)
+        lap_matrix  = self.compute_lap(torch.from_numpy(vert), torch.from_numpy(face))
 
-        # layer x B x nv
-        clusters        = torch.from_numpy(np.concatenate(clusters, axis=1))
-      
-        return features, clusters
+        eig_val, eig_vec = np.linalg.eigh(lap_matrix)
+        eig_vec = eig_vec[:,1:1+self.cfg.num_eig]
+    
+
+        features = np.hstack([vert, normal,  eig_vec])
+
+        cluster = self.compute_cluster(eig_vec, self.cfg.num_cluster)
+
+        
+        data = dict()
+        data['normal'] = normal
+        data['vert'] = vert
+        data['face'] = face
+        data['eig_vec'] = eig_vec
+        data['cluster'] = cluster
+        data['label'] = label
+        return data

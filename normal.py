@@ -9,8 +9,6 @@ def normalize_v3(arr):
     return arr
 
 def compute_normal(verts, faces):
-	verts 	= verts.cpu().data.numpy()
-	faces 	= faces.cpu().data.numpy()
 	norm 	= np.zeros( verts.shape )
 	tris 	= verts[faces]
 	n 		= np.cross( tris[::,1 ] - tris[::,0]  , tris[::,2 ] - tris[::,0] )

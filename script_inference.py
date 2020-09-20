@@ -10,11 +10,8 @@ model   = LapCluster(cfg)
 
 verts, faces = load_obj('4.obj')
 
-verts = verts[None, :, :]
-faces = faces[None, :, :]-1
+faces = faces-1
 
-verts = torch.from_numpy(verts)
-faces = torch.from_numpy(faces)
 inputs = dict()
 
 device  = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
